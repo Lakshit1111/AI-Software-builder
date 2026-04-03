@@ -1,9 +1,11 @@
 {
   "plan": [
-    "1. Initialize the basic project structure and main window.",
-    "2. Add math logic for basic arithmetic operations.",
-    "3. Implement the history feature to store and display previous calculations.",
-    "4. Design and implement the user interface for input and output fields."
+    "1. Initialize the project structure and main application entry point.",
+    "2. Create the user interface layout using HTML and CSS, including input fields, dropdown, and result display area.",
+    "3. Implement JavaScript functions to handle user interactions (input changes, button clicks).",
+    "4. Develop the core logic for parsing input values, performing arithmetic operations, and displaying results.",
+    "5. Implement error handling for division by zero and non-numeric inputs, displaying appropriate error messages.",
+    "6. Test the application for responsiveness and functionality across different devices and screen sizes."
   ],
-  "steps_completed": 4
+  "steps_completed": 6
 }

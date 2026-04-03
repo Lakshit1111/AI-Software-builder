@@ -27,12 +27,23 @@ load_dotenv()
 class State(Enum):
     """Defines the possible modes of the AI Agent."""
     INIT = auto()        # Startup
+    ENHANCING = auto()
     PLANNING = auto()    # Architecting the solution
     CODING = auto()      # Writing code
     TESTING = auto()     # verifying code
     FIXING = auto()      # Debugging errors
     FINISHED = auto()    # Success
     FAILED = auto()      # Failure
+
+
+def load_skills():
+    try:
+        with open("skills.md", "r", encoding="utf-8") as f:
+            return f.read()
+    except:
+        return ""
+
+skills = load_skills()
 
 @dataclass
 class ProjectContext:
@@ -41,6 +52,7 @@ class ProjectContext:
     All agents read from here; only the Worker writes to here.
     """
     original_prompt: str = ""
+    enhanced_prompt: str = ""
     plan: List[str] = field(default_factory=list)
     current_step_index: int = 0
     
@@ -62,40 +74,101 @@ class ProjectContext:
 # 2. BACKEND ABSTRACTION
 # ==========================================
 
+import requests
+import ollama
+
 class LLMProvider:
-    """Wrapper to switch between Ollama (Local) and OpenAI/vLLM (Remote)."""
-    def __init__(self, provider_type, model_name, api_url=None, api_key="EMPTY"):
+    """
+    Wrapper to switch between:
+    - vLLM (OpenAI-compatible REST API via requests)
+    - Ollama (local)
+    """
+
+    def __init__(
+        self,
+        provider_type,
+        model_name,
+        api_url="https://sia.sansol.in:9000/v1",
+        api_key="INTERNAL-LLM-TOKEN",
+        verify_ssl=False,
+        timeout=90
+    ):
         self.provider_type = provider_type
         self.model_name = model_name
         self.api_url = api_url
         self.api_key = api_key
-        
-        if self.provider_type == "vLLM / OpenAI":
-            self.client = OpenAI(base_url=self.api_url, api_key=self.api_key)
-        elif self.provider_type == "Ollama":
-            # Initialize Ollama client
-            self.client = ollama.Client(host=self.api_url) if self.api_url else ollama
+        self.verify_ssl = verify_ssl
+        self.timeout = timeout
 
-    def chat(self, messages, temperature=0.7):
+        if self.provider_type == "Ollama":
+            self.client = ollama.Client(host="http://localhost:11434")
+
+    # =====================================================
+    # CHAT METHOD
+    # =====================================================
+    def chat(self, messages, temperature=0.7, system_prompt=None):
         try:
             if self.provider_type == "vLLM / OpenAI":
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=temperature
-                )
-                return response.choices[0].message.content
+                return self._chat_vllm(messages, temperature, system_prompt)
 
             elif self.provider_type == "Ollama":
-                response = self.client.chat(
-                    model=self.model_name,
-                    messages=messages,
-                    options={'temperature': temperature}
-                )
-                return response['message']['content']
-                
+                return self._chat_ollama(messages, temperature)
+
+            else:
+                raise ValueError("Unsupported provider type")
+
         except Exception as e:
             return f"API_ERROR: {str(e)}"
+
+    # =====================================================
+    # vLLM (REQUESTS)
+    # =====================================================
+    def _chat_vllm(self, messages, temperature, system_prompt):
+        url = f"{self.api_url.rstrip('/')}/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        final_messages = []
+        if system_prompt:
+            final_messages.append({
+                "role": "system",
+                "content": system_prompt
+            })
+
+        final_messages.extend(messages)
+
+        payload = {
+            "model": self.model_name,
+            "messages": final_messages,
+            "temperature": temperature
+        }
+
+        r = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=self.timeout,
+            verify=self.verify_ssl
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
+
+        return r.json()["choices"][0]["message"]["content"]
+
+    # =====================================================
+    # OLLAMA
+    # =====================================================
+    def _chat_ollama(self, messages, temperature):
+        response = self.client.chat(
+            model=self.model_name,
+            messages=messages,
+            options={"temperature": temperature}
+        )
+        return response["message"]["content"]
 
 # ==========================================
 # 3. AGENT DEFINITIONS (The "Tools")
@@ -130,29 +203,64 @@ class BaseAgent:
                 text = "\n".join(clean_lines)
 
         return text.strip()
-class Planner(BaseAgent):
-    def create_plan(self, user_prompt):
-        system_prompt = (
-            "You are a Senior Technical Lead. "
-            "Your goal is to break down a project into 3-5 specific, actionable implementation tasks. "
-            "Each task must be a single, self-contained coding job."
-            "\n\n"
-            "Rules:"
-            "\n1. Do NOT use generic steps like 'Test' or 'Design'. The testing is automated."
-            "\n2. Step 1 must always be 'Initialize the basic project structure and main window'."
-            "\n3. Subsequent steps must add specific features (e.g., 'Add math logic', 'Add history feature')."
-            "\n4. Return ONLY a numbered list. No intro, no markdown."
+
+
+class PromptEnhancer(BaseAgent):
+    def enhance(self, user_prompt):
+        system_prompt = ("""
+
+            {skills}
+
+            [ROLE: ENHANSER]
+            You are an Expert Product Manager and Requirements Engineer.
+            Your job is to take a brief user request for a software application and expand it into a comprehensive, unambiguous technical prompt. 
+            \n\nStrict Rules:
+            \n1. Identify the core functionality, necessary UI/CLI components, and edge cases.
+            \n2. If it is a GUI application, explicitly specify its structure in detail.
+            \n3. Detail the expected behavior (e.g., 'Input fields must clear after submission', 'Errors must be caught and displayed safely').
+            \n4. Do not write code. Do not write the implementation steps.
+            \n5. Output ONLY the enhanced, detailed project description. No conversational intro.
+
+            """
         )
         
-        # We give it a "One-Shot" example to teach it the format
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Brief Request: {user_prompt}\n\nPlease provide the enhanced technical description."}
+        ]
+        
+        return self.llm.chat(messages, temperature=0.2)
+
+
+
+class Planner(BaseAgent):
+    def create_plan(self, user_prompt):
+        system_prompt = f"""
+            {skills}
+
+            [ROLE: Planner]
+
+            You are responsible for breaking down a project into clear, executable steps.
+
+            Focus:
+            - Convert the project into 4–6 concrete implementation steps
+            - Each step must produce a meaningful code change
+            - Steps must be ordered logically and build on each other
+
+            Output Rules:
+            - Return ONLY a numbered list
+            - No explanations
+            - No markdown
+        """
+
         example_prompt = (
-            "User: Build a calculator.\n"
+            "User: Build a basic request tracker app.\n"
             "Plan:\n"
-            "1. Create a PyQt6 main window with a display widget.\n"
-            "2. Implement the grid layout with number buttons (0-9).\n"
-            "3. Implement the operator buttons (+, -, *, /) and connect signals.\n"
-            "4. Implement the '=' logic to evaluate the expression safely.\n"
-            "5. Add a 'Clear' button to reset the display."
+            "1. Initialize the project structure and main application entry point.\n"
+            "2. Implement the user interface for submitting and viewing requests.\n"
+            "3. Add a data storage mechanism for persisting requests.\n"
+            "4. Implement logic to create, retrieve, and display requests.\n"
+            "5. Add validation and error handling for user inputs.\n"
         )
         
         messages = [
@@ -160,42 +268,62 @@ class Planner(BaseAgent):
             {"role": "user", "content": f"Example:\n{example_prompt}\n\nReal Task: {user_prompt}"}
         ]
         
-        return self.llm.chat(messages, temperature=0.2)
+        return self.llm.chat(messages, temperature=0.1)
 
 class Developer(BaseAgent):
     def write_code(self, task, context: ProjectContext):
-        system_prompt = (
-            "You are an expert Python Developer. "
-            "Your goal is to implement the requested task into the existing code base. "
-            "Return the FULL valid Python code for 'main.py' including imports."
-        )
+        system_prompt = f"""
+            {skills}
+
+            [ROLE: Developer]
+
+            You are responsible for implementing the given task into the existing codebase.
+
+            Focus:
+            - Modify the code to complete the current task
+            - Maintain compatibility with existing functionality
+            - Ensure the application remains runnable after changes
+
+            Output Rules:
+            - Return ONLY the full updated Python code for main.py
+            - No explanations
+            - No markdown
+        """
         
         user_msg = f"""
-        Current File Content (main.py):
-        {context.get_main_code() if context.get_main_code() else "# New File"}
-
+        Overall Project Goal: {context.original_prompt}
+        
         Current Task: {task}
         
-        Instructions:
-        1. Implement the feature described in the task.
-        2. Ensure all imports are at the top.
-        3. Return the complete file content.
-        4. Understand the user intent and task.
+        Current File Content (main.py):
+        {context.get_main_code() if context.get_main_code() else "# New File"}
         """
         
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg}
         ]
-        response = self.llm.chat(messages, temperature=0.4)
+        response = self.llm.chat(messages, temperature=0.1)
         return self._clean_code(response)
 
     def fix_code(self, context: ProjectContext):
-        system_prompt = (
-            "You are a Senior Debugging Engineer. "
-            "Analyze the error message and the current code. "
-            "Fix the bug and return the FULL corrected Python code."
-        )
+        system_prompt = f"""
+            {skills}
+
+            [ROLE: Debugger]
+
+            You are responsible for fixing errors in an existing Python codebase.
+
+            Focus:
+            - Identify the root cause of the error
+            - Modify the code to resolve the issue
+            - Preserve all working functionality
+
+            Output Rules:
+            - Return ONLY the full corrected Python code for main.py
+            - No explanations
+            - No markdown
+        """
         
         user_msg = f"""
         The code failed with this error:
@@ -211,7 +339,7 @@ class Developer(BaseAgent):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg}
         ]
-        response = self.llm.chat(messages, temperature=0.2)
+        response = self.llm.chat(messages, temperature=0.1)
         return self._clean_code(response)
 
 # ==========================================
@@ -235,10 +363,9 @@ class StateMachineWorker(QThread):
         try:
             llm = LLMProvider(
                 self.config['provider_type'],
-                self.config['model_name'],
-                self.config['api_url'],
-                self.config['api_key']
+                self.config['model_name']
             )
+            enhancer = PromptEnhancer(llm)
             planner = Planner(llm)
             developer = Developer(llm)
         except Exception as e:
@@ -255,6 +382,13 @@ class StateMachineWorker(QThread):
             # --- STATE: INIT ---
             if current_state == State.INIT:
                 self.log(f"🔄 State: {current_state.name}")
+                current_state = State.ENHANCING
+
+            elif current_state == State.ENHANCING:
+                self.log(f"🧠 State: {current_state.name} - enhancing prompt")
+                context.original_prompt = enhancer.enhance(context.original_prompt)
+                self.log(f"Enhanced generated prompt \n{context.original_prompt}")
+
                 current_state = State.PLANNING
 
             # --- STATE: PLANNING ---
@@ -315,7 +449,7 @@ class StateMachineWorker(QThread):
                     self.log("⚠️ State: FIXING - Max retries reached. Moving to next step with broken code.")
                     context.attempt_count = 0
                     context.current_step_index += 1
-                    current_state = State.CODING
+                    current_state = State.Failed
                 else:
                     context.attempt_count += 1
                     self.log(f"🔧 State: FIXING - Attempt {context.attempt_count}/{context.max_retries}")
@@ -412,7 +546,7 @@ class MainWindow(QMainWindow):
         self.combo_provider.addItems(["Ollama", "vLLM / OpenAI"])
         self.combo_provider.currentTextChanged.connect(self.toggle_inputs)
         
-        self.input_model = QLineEdit("llama3:latest")
+        self.input_model = QLineEdit("qwen2.5:7b")
         self.input_url = QLineEdit()
         self.input_key = QLineEdit()
         self.input_key.setEchoMode(QLineEdit.Password)
@@ -421,10 +555,10 @@ class MainWindow(QMainWindow):
         config_layout.addWidget(self.combo_provider)
         config_layout.addWidget(QLabel("Model:"))
         config_layout.addWidget(self.input_model)
-        config_layout.addWidget(QLabel("URL:"))
-        config_layout.addWidget(self.input_url)
-        config_layout.addWidget(QLabel("Key:"))
-        config_layout.addWidget(self.input_key)
+        # config_layout.addWidget(QLabel("URL:"))
+        # config_layout.addWidget(self.input_url)
+        # config_layout.addWidget(QLabel("Key:"))
+        # config_layout.addWidget(self.input_key)
         
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
@@ -473,12 +607,12 @@ class MainWindow(QMainWindow):
             self.input_url.setPlaceholderText("http://localhost:11434 (Default)")
             self.input_url.setText("")
             self.input_key.setEnabled(False)
-            self.input_model.setText("llama3:latest")
+            self.input_model.setText("qwen2.5:7b")
         else:
             self.input_url.setPlaceholderText("https://api.openai.com/v1")
             self.input_url.setText("")
             self.input_key.setEnabled(True)
-            self.input_model.setText("gpt-4o-mini")
+            self.input_model.setText("sia")
 
     def start_process(self):
         prompt = self.prompt_input.toPlainText().strip()
