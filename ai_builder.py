@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QTextEdit, QLabel, QPushButton,
                                QLineEdit, QComboBox, QGroupBox, QProgressBar, QMessageBox,
                                QSplitter, QTabWidget, QFileDialog, QDialog, QCheckBox)
-from PySide6.QtCore import QThread, Signal, Slot
+from PySide6.QtCore import QThread, Signal, Slot, Qt
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -55,10 +55,10 @@ class FileOperation:
 
 
 @dataclass
-class TerminalCommand:
-    command: str
-    description: str
-    approved: bool = False
+class TestResult:
+    passed: bool
+    error: str = ""
+    details: str = ""
 
 
 @dataclass
@@ -70,6 +70,7 @@ class ProjectContext:
 
     files: Dict[str, str] = field(default_factory=dict)
     file_operations: List[FileOperation] = field(default_factory=list)
+    execution_history: List[str] = field(default_factory=list)  # Track all actions taken
 
     last_error: str = ""
     error_traceback: str = ""
@@ -467,6 +468,49 @@ Task: Fix the error and return ALL corrected files.
         response = self.llm.chat(messages, temperature=0.1)
         return parse_multi_file_response(response)
 
+    def fix_code_with_context(self, context: ProjectContext, error: str, task_description: str):
+        """Fix code with full context of what was being implemented"""
+        system_prompt = f"""
+{SKILLS}
+
+[ROLE: Contextual Debugger]
+You are fixing a specific implementation task. You have full context of what was attempted.
+
+Debugging Focus:
+1. The task was: {task_description}
+2. The error encountered: {error}
+3. Preserve all existing working functionality
+4. Make minimal, targeted fixes
+
+Multi-File Rules:
+- If the fix requires changes in multiple files, output ALL of them
+- Use the format: ```[filename.py]\ncode here\n```
+
+Output Rules:
+- Return ONLY the corrected code, no explanations
+- Use markdown code blocks with filenames: ```[filename.py]
+"""
+        
+        file_context = ""
+        for path, content in context.files.items():
+            file_context += f"\n--- {path} ---\n{content}\n"
+
+        user_msg = f"""
+Task Description: {task_description}
+Error Encountered: {error}
+
+Current Files:
+{file_context}
+
+Fix the error and return ALL corrected files. Focus on the specific task.
+"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg}
+        ]
+        response = self.llm.chat(messages, temperature=0.1)
+        return parse_multi_file_response(response)
+
     def _classify_error(self, error: str) -> str:
         error_lower = error.lower()
         if "syntaxerror" in error_lower or "invalid syntax" in error_lower:
@@ -491,11 +535,124 @@ Task: Fix the error and return ALL corrected files.
             return "Unknown Error"
 
 
+class Tester(BaseAgent):
+    def test_implementation(self, context: ProjectContext, task_description: str) -> TestResult:
+        """Test the current implementation with both static analysis AND execution"""
+        
+        # Step 1: Static analysis by LLM
+        system_prompt = f"""
+{SKILLS}
+
+[ROLE: QA Engineer + Runtime Tester]
+You are a meticulous software tester who validates Python implementations.
+
+Testing Strategy (perform ALL checks):
+
+1. SYNTAX CHECK:
+- Check if Python code has syntax errors
+- Verify all imports are valid
+- Check for unmatched brackets/parens
+
+2. STRUCTURE CHECK:
+- Verify class definitions are complete
+- Verify function definitions are complete  
+- Check for incomplete statements
+
+3. LOGIC CHECK:
+- Verify the code implements the required functionality
+- Check for common bugs (division by zero, uninitialized vars, etc.)
+
+Output Rules:
+- Return ONLY a JSON object:
+{{
+  "passed": true/false,
+  "error": "detailed error message if failed, empty if passed",
+  "details": "specific test observations with line numbers if possible"
+}}
+"""
+        
+        file_context = ""
+        for path, content in context.files.items():
+            file_context += f"\n=== FILE: {path} ===\n{content}\n"
+            
+        user_msg = f"""
+Task to Validate: {task_description}
+
+Current Implementation:
+{file_context}
+
+Project Type: {context.project_type}
+
+Analyze the code thoroughly and return a JSON test result.
+"""
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg}
+        ]
+        
+        # First: LLM static analysis
+        llm_result = self.llm.chat(messages, temperature=0.0)
+        parsed = self._parse_test_result(llm_result)
+        
+        # Second: Actually try to run the code (if no syntax errors)
+        if parsed.passed:
+            sandbox = Sandbox()
+            sandbox.write_files(context.files)
+            
+            # Find main file
+            main_file = self._find_main_file(context.files)
+            stdout, stderr, returncode = sandbox.run_code(main_file, timeout=5)
+            
+            if returncode != 0:
+                parsed.passed = False
+                parsed.error = f"Runtime Error: {stderr[:300]}" if stderr else f"Exit code: {returncode}"
+                parsed.details += f"\n[Runtime Test Failed] stdout: {stdout[:100]}, stderr: {stderr[:200]}"
+            
+            sandbox.cleanup()
+        
+        return parsed
+
+    def _parse_test_result(self, response: str) -> TestResult:
+        try:
+            # Extract JSON from response if wrapped in markdown
+            if "```json" in response:
+                json_str = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                json_str = response.split("```")[1].split("```")[0]
+            else:
+                json_str = response.strip()
+                
+            result_dict = json.loads(json_str)
+            return TestResult(
+                passed=result_dict.get("passed", False),
+                error=result_dict.get("error", ""),
+                details=result_dict.get("details", "")
+            )
+        except Exception as e:
+            return TestResult(
+                passed=False,
+                error=f"Test parser error: {str(e)}",
+                details=f"Raw response: {response[:200]}"
+            )
+
+    def _find_main_file(self, files: Dict[str, str]) -> str:
+        if "main.py" in files:
+            return "main.py"
+        for path in files:
+            if path.endswith("/main.py") or path.endswith("\\main.py"):
+                return path
+        for path in files:
+            if path.endswith(".py"):
+                return path
+        return list(files.keys())[0] if files else "main.py"
+
+
 # ==========================================
-# 4. STATE MACHINE WORKER (The "Brain")
+# 4. MASTER AGENT (The Orchestrator)
 # ==========================================
 
-class StateMachineWorker(QThread):
+class MasterAgent(QThread):
     log_signal = Signal(str)
     finished_signal = Signal(bool, str)
     command_signal = Signal(str)
@@ -508,11 +665,10 @@ class StateMachineWorker(QThread):
         self.is_running = True
         self._pending_command = False
         self._command_approved = False
-        self._context: Optional[ProjectContext] = None
+        self.context: Optional[ProjectContext] = None
 
     def run(self):
-        self.log("Initializing AI State Machine...")
-
+        self.log("🧠 Initializing Master Agent...")
         try:
             llm = LLMProvider(
                 provider_type=self.config['provider_type'],
@@ -524,227 +680,106 @@ class StateMachineWorker(QThread):
             enhancer = PromptEnhancer(llm)
             planner = Planner(llm)
             developer = Developer(llm)
+            tester = Tester(llm)  # New testing agent
+            
         except Exception as e:
             self.finished_signal.emit(False, f"Setup Error: {e}")
             return
 
-        context = ProjectContext(original_prompt=self.user_prompt)
-        self._context = context
-        current_state = State.INIT
+        # Initialize context with full history
+        self.context = ProjectContext(original_prompt=self.user_prompt)
+        self.context.execution_history = []  # Track all actions taken
         sandbox = Sandbox()
 
-        while self.is_running and current_state not in [State.FINISHED, State.FAILED]:
+        # Phase 1: Understand and Plan
+        self.log("📝 Phase 1: Understanding Requirements...")
+        enhanced = enhancer.enhance(self.context.original_prompt)
+        if not enhanced.startswith("API_ERROR"):
+            self.context.enhanced_prompt = enhanced
+            
+        self.log("📋 Phase 2: Creating Development Plan...")
+        plan_result = planner.create_plan(self.context.enhanced_prompt or self.context.original_prompt)
+        if plan_result.startswith("API_ERROR"):
+            self.finished_signal.emit(False, f"Planning failed: {plan_result}")
+            return
+            
+        self.context.plan = self._parse_plan(plan_result)
+        self.log(f"Plan created with {len(self.context.plan)} major milestones")
 
-            if current_state == State.INIT:
-                self.log(f"State: {current_state.name}")
-                current_state = State.ENHANCING
-
-            elif current_state == State.ENHANCING:
-                self.log(f"State: {current_state.name} - Enhancing prompt...")
-                result = enhancer.enhance(context.original_prompt)
-                if result.startswith("API_ERROR"):
-                    self.finished_signal.emit(False, f"Enhancer failed: {result}")
-                    return
-                context.enhanced_prompt = result
-                self.log(f"Enhanced prompt generated ({len(result)} chars)")
-                current_state = State.PLANNING
-
-            elif current_state == State.PLANNING:
-                self.log(f"State: {current_state.name} - Architecting solution...")
-                raw_plan = planner.create_plan(context.enhanced_prompt or context.original_prompt)
-                if raw_plan.startswith("API_ERROR"):
-                    self.finished_signal.emit(False, f"Planner failed: {raw_plan}")
-                    return
-
-                context.plan = []
-                for line in raw_plan.split('\n'):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    cleaned = re.sub(r'^[\d\-\*\.\s]+', '', line).strip()
-                    if cleaned:
-                        context.plan.append(cleaned)
-
-                if not context.plan:
-                    context.plan = [context.enhanced_prompt or context.original_prompt]
-
-                self.log(f"Plan generated with {len(context.plan)} steps:")
-                for i, step in enumerate(context.plan, 1):
-                    self.log(f"  {i}. {step}")
-
-                current_state = State.CODING
-
-            elif current_state == State.CODING:
-                if context.current_step_index >= len(context.plan):
-                    current_state = State.FINISHED
-                    continue
-
-                step_desc = context.plan[context.current_step_index]
-                self.log(f"\nState: {current_state.name} - Step {context.current_step_index + 1}/{len(context.plan)}")
-                self.log(f"  Task: {step_desc}")
-
-                context.detect_project_type()
-                new_files = developer.write_code(step_desc, context)
-
-                if not new_files:
-                    self.log("WARNING: Developer returned no files. Retrying...")
-                    context.attempt_count += 1
-                    if context.attempt_count >= context.max_retries:
-                        self.log("Max retries on coding. Moving on.")
-                        context.attempt_count = 0
-                        context.current_step_index += 1
-                        current_state = State.CODING
-                    continue
-
-                context.attempt_count = 0
-                for path, content in new_files.items():
-                    context.set_file(path, content)
-                    self.log(f"  Created/Updated: {path}")
-
-                current_state = State.TESTING
-
-            elif current_state == State.TESTING:
-                self.log(f"State: {current_state.name} - Verifying code...")
-
-                syntax_ok = True
-                for path, code in context.files.items():
-                    syn_err = check_syntax(code)
-                    if syn_err:
-                        self.log(f"  Syntax error in {path}: {syn_err}")
-                        context.syntax_errors += f"{path}: {syn_err}\n"
-                        syntax_ok = False
-
-                if not syntax_ok:
-                    context.last_error = "Syntax errors detected:\n" + context.syntax_errors
-                    context.error_traceback = ""
-                    current_state = State.FIXING
-                    continue
-
-                sandbox.cleanup()
-                sandbox = Sandbox()
-                sandbox.write_files(context.files)
-
-                main_file = self._resolve_main_file(context.files)
-                stdout, stderr, returncode = sandbox.run_code(main_file, timeout=8)
-
-                if returncode != 0:
-                    error_msg = stderr if stderr else f"Process exited with code {returncode}"
-                    self.log(f"  Test Failed: {error_msg[:200]}")
-                    context.last_error = error_msg
-                    context.error_traceback = stderr
-                    current_state = State.FIXING
-                else:
-                    self.log("  Test Passed.")
-                    context.attempt_count = 0
-                    context.current_step_index += 1
-
-                    if context.pending_commands:
-                        current_state = State.TERMINAL_APPROVAL
-                    elif context.current_step_index >= len(context.plan):
-                        current_state = State.FINISHED
+        # Phase 3: Execute with Orchestration
+        self.log("🚀 Phase 3: Executing Development Cycle...")
+        for milestone_idx, milestone in enumerate(self.context.plan):
+            if not self.is_running:
+                break
+                
+            self.log(f"\n📍 Milestone {milestone_idx + 1}/{len(self.context.plan)}: {milestone}")
+            
+            # Developer creates/modifies code
+            self.log("  👨‍💻 Developer: Implementing functionality...")
+            dev_result = developer.write_code(milestone, self.context)
+            if dev_result:
+                for path, content in dev_result.items():
+                    self.context.set_file(path, content)
+                    self.context.execution_history.append(f"Created/Updated: {path}")
+            
+            # Tester validates the implementation
+            self.log("  🧪 Tester: Validating implementation...")
+            test_result = tester.test_implementation(self.context, milestone)
+            
+            if not test_result.passed:
+                self.log(f"  ⚠️  Test failed: {test_result.error}")
+                # Try to fix with developer
+                self.log("  🔧 Developer: Attempting to fix...")
+                fix_result = developer.fix_code_with_context(self.context, test_result.error, milestone)
+                if fix_result:
+                    for path, content in fix_result.items():
+                        self.context.set_file(path, content)
+                        
+                    # Re-test
+                    retest_result = tester.test_implementation(self.context, milestone)
+                    if not retest_result.passed:
+                        self.log(f"  ❌ Fix attempt failed: {retest_result.error}")
+                        self.context.execution_history.append(f"Failed fix for: {milestone}")
                     else:
-                        current_state = State.CODING
-
-            elif current_state == State.FIXING:
-                if context.attempt_count >= context.max_retries:
-                    self.log(f"WARNING: Max fix retries ({context.max_retries}) reached.")
-                    self.log("Moving to next step with current code.")
-                    context.attempt_count = 0
-                    context.current_step_index += 1
-                    context.syntax_errors = ""
-                    context.error_traceback = ""
-                    if context.current_step_index >= len(context.plan):
-                        current_state = State.FAILED
-                    else:
-                        current_state = State.CODING
+                        self.log("  ✅ Fix successful!")
+                        self.context.execution_history.append(f"Fixed: {milestone}")
                 else:
-                    context.attempt_count += 1
-                    self.log(f"State: {current_state.name} - Attempt {context.attempt_count}/{context.max_retries}")
-                    self.log(f"  Error: {context.last_error[:150]}")
+                    self.context.execution_history.append(f"Unfixable: {milestone}")
+            else:
+                self.log("  ✅ Implementation validated!")
+                self.context.execution_history.append(f"Completed: {milestone}")
 
-                    fixed_files = developer.fix_code(context)
-
-                    if not fixed_files:
-                        self.log("WARNING: Fixer returned no files. Retrying...")
-                        continue
-
-                    context.syntax_errors = ""
-                    context.error_traceback = ""
-
-                    for path, content in fixed_files.items():
-                        context.set_file(path, content)
-
-                    current_state = State.TESTING
-
-            elif current_state == State.TERMINAL_APPROVAL:
-                if not context.pending_commands:
-                    if context.current_step_index >= len(context.plan):
-                        current_state = State.FINISHED
-                    else:
-                        current_state = State.CODING
-                    continue
-
-                cmd = context.pending_commands.pop(0)
-                self.log(f"\nTerminal command requested: {cmd.command}")
-                self.log(f"Description: {cmd.description}")
-
-                self._pending_command = True
-                self._command_approved = False
-                self.command_signal.emit(json.dumps({
-                    "command": cmd.command,
-                    "description": cmd.description
-                }))
-
-                while self._pending_command and self.is_running:
-                    time.sleep(0.1)
-
-                if self._command_approved:
-                    self.log(f"  Executing: {cmd.command}")
-                    try:
-                        result = subprocess.run(
-                            cmd.command,
-                            shell=True,
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                            cwd=sandbox.work_dir,
-                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                        )
-                        if result.stdout:
-                            self.log(f"  Output: {result.stdout[:500]}")
-                        if result.returncode != 0:
-                            self.log(f"  Warning: Exit code {result.returncode}")
-                            if result.stderr:
-                                self.log(f"  Stderr: {result.stderr[:300]}")
-                        context.approved_commands.append(cmd.command)
-                    except Exception as e:
-                        self.log(f"  Command failed: {e}")
-                else:
-                    self.log(f"  Command skipped by user.")
-
-                self._pending_command = False
-
-                if context.pending_commands:
-                    current_state = State.TERMINAL_APPROVAL
-                elif context.current_step_index >= len(context.plan):
-                    current_state = State.FINISHED
-                else:
-                    current_state = State.CODING
-
+        # Phase 4: Final Validation
+        self.log("\n🏁 Phase 4: Final Validation...")
+        sandbox.cleanup()
+        sandbox = Sandbox()
+        sandbox.write_files(self.context.files)
+        
+        main_file = self._resolve_main_file(self.context.files)
+        stdout, stderr, returncode = sandbox.run_code(main_file, timeout=15)
+        
+        if returncode == 0:
+            self.log("✅ Final validation passed!")
+            self.save_project(self.context)
+            self.log("\n✨ Project Build Complete!")
+            self.finished_signal.emit(True, f"Project saved. {len(self.context.files)} file(s) created.")
+        else:
+            error_msg = stderr if stderr else f"Exit code {returncode}"
+            self.log(f"❌ Final validation failed: {error_msg}")
+            self.finished_signal.emit(False, f"Final validation failed: {error_msg}")
+            
         sandbox.cleanup()
 
-        if current_state == State.FINISHED:
-            self.save_project(context)
-            self.log("\nProject Build Complete!")
-            self.finished_signal.emit(True, f"Project saved. {len(context.files)} file(s) created.")
-        elif not self.is_running:
-            self.finished_signal.emit(False, "Process stopped by user.")
-        else:
-            self.finished_signal.emit(False, "Build Failed - max retries exceeded.")
-
-    def approve_command(self, approved: bool):
-        self._command_approved = approved
-        self._pending_command = False
+    def _parse_plan(self, raw_plan: str) -> List[str]:
+        plan = []
+        for line in raw_plan.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            cleaned = re.sub(r'^[\d\-\*\.\s]+', '', line).strip()
+            if cleaned:
+                plan.append(cleaned)
+        return plan if plan else [self.context.enhanced_prompt or self.context.original_prompt]
 
     def _resolve_main_file(self, files: Dict[str, str]) -> str:
         if "main.py" in files:
@@ -769,10 +804,11 @@ class StateMachineWorker(QThread):
         with open(os.path.join(project_dir, "build_log.json"), "w", encoding="utf-8") as f:
             json.dump({
                 "plan": context.plan,
-                "steps_completed": context.current_step_index,
+                "steps_completed": len(context.execution_history),
                 "files": list(context.files.keys()),
                 "project_type": context.project_type,
-                "approved_commands": context.approved_commands
+                "approved_commands": context.approved_commands,
+                "execution_history": context.execution_history
             }, f, indent=2)
 
     def log(self, msg):
@@ -780,7 +816,13 @@ class StateMachineWorker(QThread):
 
     def stop(self):
         self.is_running = False
-        self._pending_command = False
+
+
+# ==========================================
+# 5. LEGACY STATE MACHINE WORKER (Deprecated)
+# ==========================================
+
+# StateMachineWorker class has been replaced by MasterAgent for better orchestration
 
 
 # ==========================================
@@ -790,36 +832,80 @@ class StateMachineWorker(QThread):
 class CommandApprovalDialog(QDialog):
     def __init__(self, command, description, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Terminal Command Approval")
-        self.setMinimumWidth(500)
+        self.setWindowTitle("🤖 AI Command Approval Required")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(300)
         self.approved = False
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        layout.addWidget(QLabel("The AI wants to run this command:"))
+        # Header
+        header = QLabel("⚠️ Terminal Command Request")
+        header.setStyleSheet("font-size: 18px; font-weight: bold; color: #FF9800;")
+        layout.addWidget(header)
 
+        # Command display
+        layout.addWidget(QLabel("Command to execute:"))
         cmd_label = QLabel(command)
-        cmd_label.setStyleSheet("background-color: #333; color: #0f0; font-family: Consolas; padding: 10px;")
+        cmd_label.setStyleSheet("""
+            background-color: #333; 
+            color: #0f0; 
+            font-family: Consolas, 'Courier New', monospace; 
+            padding: 15px; 
+            border-radius: 5px;
+            font-size: 14px;
+        """)
         cmd_label.setWordWrap(True)
+        cmd_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(cmd_label)
 
-        layout.addWidget(QLabel(f"Description: {description}"))
+        # Description
+        desc_label = QLabel(f"📝 Description: {description}")
+        desc_label.setStyleSheet("font-size: 14px; color: #666;")
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
 
-        self.dont_ask = QCheckBox("Don't ask again for safe commands (pip install, mkdir, etc.)")
+        # Safety checkbox
+        self.dont_ask = QCheckBox("✅ Don't ask again for safe commands (pip install, mkdir, etc.)")
+        self.dont_ask.setStyleSheet("font-size: 13px;")
         layout.addWidget(self.dont_ask)
 
+        # Buttons
         btn_layout = QHBoxLayout()
-        btn_deny = QPushButton("Deny")
-        btn_deny.setStyleSheet("background-color: #D32F2F; color: white; padding: 8px;")
+        btn_layout.addStretch()
+        
+        btn_deny = QPushButton("❌ Deny")
+        btn_deny.setStyleSheet("""
+            background-color: #D32F2F; 
+            color: white; 
+            padding: 10px 20px; 
+            font-size: 14px;
+            font-weight: bold;
+            border-radius: 5px;
+        """)
         btn_deny.clicked.connect(lambda: self._respond(False))
+        btn_deny.setCursor(Qt.PointingHandCursor)
 
-        btn_approve = QPushButton("Approve")
-        btn_approve.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px;")
+        btn_approve = QPushButton("✅ Approve Command")
+        btn_approve.setStyleSheet("""
+            background-color: #4CAF50; 
+            color: white; 
+            padding: 10px 20px; 
+            font-size: 14px;
+            font-weight: bold;
+            border-radius: 5px;
+        """)
         btn_approve.clicked.connect(lambda: self._respond(True))
+        btn_approve.setCursor(Qt.PointingHandCursor)
 
         btn_layout.addWidget(btn_deny)
         btn_layout.addWidget(btn_approve)
         layout.addLayout(btn_layout)
+
+        # Set focus to approve button
+        btn_approve.setDefault(True)
 
     def _respond(self, approved):
         self.approved = approved
@@ -829,8 +915,8 @@ class CommandApprovalDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cognitive AI Builder - Multi-File")
-        self.resize(1200, 900)
+        self.setWindowTitle("Cognitive AI Builder - Master Orchestration")
+        self.resize(1400, 1000)  # Increased size for better layout
         self._safe_commands = {"pip", "pip3", "mkdir", "echo", "cd", "dir", "ls", "python -m pip"}
         self.setup_ui()
 
@@ -839,11 +925,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
-        header = QLabel("Cognitive AI Builder - Multi-File, Sandbox, Terminal Approval")
-        header.setStyleSheet("font-size: 18px; font-weight: bold; color: #4CAF50;")
+        header = QLabel("🤖 Cognitive AI Builder - Master Orchestration Architecture")
+        header.setStyleSheet("font-size: 20px; font-weight: bold; color: #4CAF50; padding: 10px;")
         main_layout.addWidget(header)
 
-        config_group = QGroupBox("LLM Configuration")
+        # Config Section
+        config_group = QGroupBox("🧠 LLM Configuration")
         config_layout = QHBoxLayout()
 
         self.combo_provider = QComboBox()
@@ -869,23 +956,35 @@ class MainWindow(QMainWindow):
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
 
+        # Input Section
+        prompt_instruction = QLabel("🎯 Enter your project description below:")
+        prompt_instruction.setStyleSheet("font-size: 14px; color: #333; font-weight: bold;")
+        main_layout.addWidget(prompt_instruction)
+        
         self.prompt_input = QTextEdit()
-        self.prompt_input.setPlaceholderText("Describe the Python application you want to build...")
-        self.prompt_input.setMaximumHeight(100)
+        self.prompt_input.setPlaceholderText("📘 Describe the Python application you want to build (e.g., 'A scientific calculator with unit conversion')...")
+        self.prompt_input.setMaximumHeight(120)
+        self.prompt_input.setStyleSheet("""
+            border: 2px solid #007ACC;
+            border-radius: 5px;
+            padding: 10px;
+            font-size: 14px;
+        """)
         main_layout.addWidget(self.prompt_input)
 
+        # Controls
         btn_layout = QHBoxLayout()
-        self.btn_start = QPushButton("Start Build")
-        self.btn_start.setStyleSheet("background-color: #007ACC; color: white; padding: 8px; font-weight: bold;")
+        self.btn_start = QPushButton("🚀 Start Build Process")
+        self.btn_start.setStyleSheet("background-color: #007ACC; color: white; padding: 10px; font-weight: bold; font-size: 14px;")
         self.btn_start.clicked.connect(self.start_process)
-
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setStyleSheet("background-color: #D32F2F; color: white; padding: 8px;")
+        
+        self.btn_stop = QPushButton("⏹️ Stop Process")
+        self.btn_stop.setStyleSheet("background-color: #D32F2F; color: white; padding: 10px; font-size: 14px;")
         self.btn_stop.clicked.connect(self.stop_process)
         self.btn_stop.setEnabled(False)
 
-        self.btn_save_as = QPushButton("Save As...")
-        self.btn_save_as.setStyleSheet("background-color: #FF9800; color: white; padding: 8px;")
+        self.btn_save_as = QPushButton("💾 Save Project As...")
+        self.btn_save_as.setStyleSheet("background-color: #FF9800; color: white; padding: 10px; font-size: 14px;")
         self.btn_save_as.clicked.connect(self.save_as)
 
         btn_layout.addWidget(self.btn_start)
@@ -893,34 +992,66 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_save_as)
         main_layout.addLayout(btn_layout)
 
+        # Progress & Logs
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setRange(0, 0) # Indeterminate initially
         self.progress_bar.hide()
         main_layout.addWidget(self.progress_bar)
 
+        # Main Content Area (Log + Files)
         splitter = QSplitter()
+        splitter.setContentsMargins(10, 10, 10, 10)
 
+        # Log Panel
         log_group = QWidget()
         log_layout = QVBoxLayout(log_group)
         log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(QLabel("Build Log:"))
+        log_header = QLabel("📋 Build Process Log")
+        log_header.setStyleSheet("font-weight: bold; font-size: 16px; color: #2196F3;")
+        log_layout.addWidget(log_header)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setStyleSheet("background-color: #1E1E1E; color: #00FF00; font-family: Consolas; font-size: 12px;")
+        self.log_view.setStyleSheet("""
+            background-color: #1E1E1E; 
+            color: #00FF00; 
+            font-family: Consolas, 'Courier New', monospace; 
+            font-size: 13px;
+            padding: 5px;
+        """)
+        self.log_view.setMaximumHeight(200)
         log_layout.addWidget(self.log_view)
         splitter.addWidget(log_group)
 
+        # Files Panel
         files_group = QWidget()
         files_layout = QVBoxLayout(files_group)
         files_layout.setContentsMargins(0, 0, 0, 0)
+        files_header = QLabel("📄 Generated Files")
+        files_header.setStyleSheet("font-weight: bold; font-size: 16px; color: #4CAF50;")
+        files_layout.addWidget(files_header)
         self.file_tabs = QTabWidget()
         self.file_tabs.setTabsClosable(False)
+        self.file_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #CCCCCC;
+            }
+            QTabBar::tab {
+                background: #F0F0F0;
+                border: 1px solid #CCCCCC;
+                padding: 8px 15px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #007ACC;
+                color: white;
+            }
+        """)
         files_layout.addWidget(self.file_tabs)
         splitter.addWidget(files_group)
 
-        splitter.setSizes([600, 600])
+        splitter.setSizes([300, 700])  # Give more space to files panel
         main_layout.addWidget(splitter)
-
+        
         self.toggle_inputs("Ollama")
 
     def toggle_inputs(self, text):
@@ -954,7 +1085,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(True)
         self.progress_bar.show()
 
-        self.worker = StateMachineWorker(prompt, config)
+        self.worker = MasterAgent(prompt, config)
         self.worker.log_signal.connect(self.log_view.append)
         self.worker.finished_signal.connect(self.process_finished)
         self.worker.command_signal.connect(self.handle_command_request)
